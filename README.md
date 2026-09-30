@@ -8,7 +8,8 @@ This hub fixes that. It gives you:
 
 - **One URL for everything** — `https://plan.example.com` lists every live review across your workstations and forwards to it (behind your own auth).
 - **Approve / deny from the hub** — decide a live review without opening the per-session page.
-- **An archive browser** — every decided plan, searchable, rendered with Markdown and Mermaid.
+- **An archive you actually own** — import any plan into a writable store, then tag it, edit it, soft-delete and restore it, or delete it for good.
+- **Re-open and apply** — turn an archived plan back into a live review, or hand it straight to an implementation agent on the workstation it came from.
 - **Stable port-derived URLs** — each review keeps a predictable `p<port>.plan.example.com` address.
 
 It is deliberately **control-plane only**: the hub never sits in the review data path, so if it dies, in-flight reviews are unaffected.
@@ -84,6 +85,9 @@ HUB_LABELS=10.0.0.10=workstation-a,10.0.0.11=workstation-b
 HUB_PUBLIC_SUFFIX=plan.example.com
 HUB_BIND=127.0.0.1
 HUB_PORT=8899
+HUB_ARCHIVE_DIR=/opt/plan-hub/archive
+# workstation agents (see "Workstation agent" below); tokens are per-host secrets
+HUB_AGENTS=10.0.0.10:8898=<token-a>,10.0.0.11:8898=<token-b>
 ```
 
 ### nginx
@@ -285,7 +289,15 @@ Useful env vars: `PLANNOTATOR_PORT` (single port or `start-end` range), `PLANNOT
 | `GET /api/live/plan?host=&port=` | The plan currently under review |
 | `POST /api/sessions/decide` | `{host, port, decision:"approve"\|"deny", feedback?}` → forwards to the review server |
 | `GET /api/plans` | Merged archive index (`?refresh` to bust the cache) |
-| `GET /api/plans/raw?host=&filename=` | Raw archived markdown |
+| `GET /api/plans/raw?host=&filename=` | Raw archived markdown (read-only aggregation) |
+| `GET /api/archive/list[?includeDeleted=1]` | The writable archive store: metas, tag list, counts |
+| `POST /api/archive/import` | `{host, filename}` or `{host, port}` → `{id, created}` (idempotent) |
+| `GET /api/archive/get?id=` | `{id, markdown, meta}` |
+| `POST /api/archive/update` | `{id, markdown?, title?, note?, tags?}` |
+| `POST /api/archive/tag` | `{ids, add, remove}` — bulk tagging |
+| `POST /api/archive/delete` / `restore` | `{ids, hard?}` — soft delete, restore, or hard delete |
+| `POST /api/archive/reopen` | `{id, host?}` → start a live review from a stored plan |
+| `POST /api/archive/apply` | `{id, host?, projectDir?}` → hand a stored plan to the workstation's implementation agent |
 | `GET /healthz` | Liveness |
 
 ### About the decision endpoint
@@ -296,7 +308,56 @@ The only integration surface Plannotator documents as stable is **`/api/external
 
 ---
 
-## Security
+## The archive store
+
+Plannotator's own archive is **strictly read-only** — mutations get `403 "Archive is read-only"` — and its listing is cached for the life of the archive session, so an entry you dislike is unfixable from the UI. The hub therefore keeps its own store, separate from (and additive to) the read-only aggregation of the workstations:
+
+```
+/opt/plan-hub/archive/
+  index.json        {"version":1,"plans":{"<id>":{…meta…}}}
+  plans/<id>.md     the markdown body
+```
+
+Metadata per plan: `id, title, slug, project, host, originFilename, date, status, tags[], note, source (import|live), archivedAt, updatedAt, size, deleted`.
+
+- **Import** copies a plan (from a workstation archive entry or a live session) into the store and is **idempotent** on `host`+`originFilename` — re-importing updates rather than duplicates.
+- **Tags** are normalised (lowercased, trimmed, unique, max 32 chars, max 20 per plan) and can be applied in bulk.
+- **Delete is soft by default** (`deleted:true`, recoverable with `restore`); `hard:true` removes the index entry and the markdown.
+- Writes are atomic (temp file + `os.replace`) and guarded by a lock; a corrupt index is logged and treated as empty rather than crashing the hub.
+
+The UI at `/plans` is the manager: search, status filter, tag chips with counts (ANY/ALL), multi-select bulk tagging, soft/hard delete and restore, inline title/note/tag editing, markdown editing, and Re-open / Apply.
+
+## Workstation agent
+
+Two of those actions must happen *on the workstation* — starting a review there, or launching an implementation — and Plannotator exposes no API for either. `planhub-agent.py` fills that gap; it runs on each workstation as a systemd **user** service bound `0.0.0.0:8898`.
+
+| Endpoint | Effect |
+|---|---|
+| `GET /healthz` | Liveness (the only unauthenticated route) |
+| `POST /api/agent/reopen` | Writes the markdown to `~/.planhub/work/`, then runs `plannotator annotate <file> --gate --json --result-file <file>.result.json` in that host's port slice; returns the discovered port/URL |
+| `POST /api/agent/apply` | Writes the markdown to `~/.planhub/apply/`, then runs the **env-configured** `PLANHUB_APPLY_COMMAND` (substituting `{plan}` and `{project}`); records a job in `~/.planhub/jobs.json` |
+| `GET /api/agent/jobs`, `/api/agent/job?id=` | Job list / status (pid liveness + log tail) |
+
+Safety properties, deliberately:
+
+- **Fail-closed auth.** `PLANHUB_AGENT_TOKEN` is required or the agent refuses to start; every route except `/healthz` needs `X-Planhub-Token` (constant-time compare).
+- **The request can never name a command.** `apply` executes only `PLANHUB_APPLY_COMMAND` from the unit's environment; the request supplies a plan, not a command.
+- Filenames are reduced to a basename (no traversal), markdown is capped at 2 MB, and `Content-Length` is required.
+
+Install on each workstation as in the quick-start above, with `/etc/planhub-agent.env` (mode `600`, owned by the login user because it is read by the *user* manager):
+
+```ini
+PLANHUB_AGENT_TOKEN=<openssl rand -hex 16>
+PLANHUB_AGENT_PORT=8898
+PLANHUB_APPLY_COMMAND=opencode run --agent build "Implement the plan at {plan}"
+```
+
+Then register it with the hub in `HUB_AGENTS` (`10.0.0.10:8898=<token>`), so `/api/archive/reopen` and `/api/archive/apply` know where to send work.
+
+> **`apply` is the one action that starts an agent doing real work.** It only runs when a human clicks Apply, and only the command you configured. Leave `PLANHUB_APPLY_COMMAND` unset to disable it — the API then returns "apply is not configured on this workstation".
+
+---
+
 
 Read this before exposing anything.
 
@@ -304,7 +365,8 @@ Read this before exposing anything.
 - Therefore: bind reviews to `0.0.0.0` only on a **trusted** network, gate the edge with OAuth (as above), and firewall each workstation so only the hub host can reach the port ranges.
 - The hub's archive and decide endpoints are likewise unauthenticated **by design** — it is meant to sit behind your auth proxy, not on the open internet.
 - Plan content can include internal detail (paths, code, hostnames). Do not enable public sharing on the review server if that matters to you (`PLANNOTATOR_SHARE_URL`, and Plannotator's own share setting, control this).
-- The hub is read-only with respect to your filesystem: it never writes to `~/.plannotator`.
+- The hub writes only to its own archive directory (`HUB_ARCHIVE_DIR`) and never into `~/.plannotator`. The **workstation agent** writes there indirectly: `reopen` starts a real `plannotator annotate`, which saves the decision normally when reviewed.
+- The agent can start a review, and — only if you configure `PLANHUB_APPLY_COMMAND` — start an implementation. Keep `:8898` on a trusted network, treat the tokens as secrets, and firewall it to the hub host alongside the review port ranges.
 
 ---
 

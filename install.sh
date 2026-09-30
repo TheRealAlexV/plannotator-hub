@@ -114,7 +114,13 @@ say ""
 say "==> Staging configuration and workstation assets"
 run install -m 0644 "$SRC_DIR/systemd/plan-hub.env.example" "$PREFIX/plan-hub.env.example"
 run install -m 0755 "$SRC_DIR/workstation/plannotator-update.sh" "$PREFIX/workstation/plannotator-update.sh"
-for unit in "$SRC_DIR"/systemd/plannotator-*.service "$SRC_DIR"/systemd/plannotator-*.timer; do
+if [ -f "$SRC_DIR/workstation/planhub-agent.py" ]; then
+  run install -m 0755 "$SRC_DIR/workstation/planhub-agent.py" "$PREFIX/workstation/planhub-agent.py"
+else
+  say "  (skip planhub-agent.py - re-open/apply will be unavailable)"
+fi
+for unit in "$SRC_DIR"/systemd/plannotator-*.service "$SRC_DIR"/systemd/plannotator-*.timer \
+            "$SRC_DIR"/systemd/planhub-agent.service "$SRC_DIR"/systemd/planhub-agent.env.example; do
   [ -e "$unit" ] || continue
   run install -m 0644 "$unit" "$PREFIX/systemd/$(basename "$unit")"
 done
@@ -156,10 +162,19 @@ cat <<EOF
 
 5. Deploy the per-workstation pieces on each workstation:
      - copy "$PREFIX/workstation/plannotator-update.sh" to ~/.local/bin/
-     - adapt and install "$PREFIX"/systemd/plannotator-update.{service,timer}
-       and plannotator-archive.service into ~/.config/systemd/user/
-       (edit the /home/user/... paths for the real user)
-     - systemctl --user enable --now plannotator-archive plannotator-update.timer
+     - copy "$PREFIX/workstation/planhub-agent.py" to ~/.local/bin/   (re-open / apply)
+     - create /etc/planhub-agent.env (mode 600) from planhub-agent.env.example:
+         PLANHUB_AGENT_TOKEN=<openssl rand -hex 16>
+         PLANHUB_AGENT_PORT=8898
+         PLANHUB_APPLY_COMMAND=opencode run --agent build "Implement the plan at {plan}"
+       Leave PLANHUB_APPLY_COMMAND unset to disable apply.
+     - adapt and install "$PREFIX"/systemd/plannotator-update.{service,timer},
+       plannotator-archive.service and planhub-agent.service into
+       ~/.config/systemd/user/   (edit the /home/user/... paths for the real user)
+     - systemctl --user daemon-reload
+       systemctl --user enable --now plannotator-archive plannotator-update.timer planhub-agent
+     - register this workstation in HUB_AGENTS on the hub with its token
 
-The hub only scans and aggregates; it never proxies live review traffic.
+The hub scans and aggregates, forwards approve/deny, and owns its own archive
+store; it never sits in the path of live review traffic.
 EOF

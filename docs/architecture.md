@@ -51,11 +51,91 @@ an explicit `start-end` per host rather than a shared pool.
 | GET | `/api/plans/raw?host=&filename=` | raw markdown for one archived plan |
 | GET | `/api/live/plan?host=&port=` | fetch a live session's plan from its workstation |
 | POST | `/api/sessions/decide` | forward an approve/deny decision to a session |
+| GET | `/api/archive/list` | list stored plans (add `?includeDeleted=1` for soft-deleted) |
+| POST | `/api/archive/import` | fetch + store a plan (idempotent per host+filename) |
+| GET | `/api/archive/get?id=` | one stored plan: markdown + meta |
+| POST | `/api/archive/update` | edit markdown/title/note/tags of one plan |
+| POST | `/api/archive/tag` | add/remove tags on many plans |
+| POST | `/api/archive/delete` | soft-delete (default) or hard-delete plans |
+| POST | `/api/archive/restore` | clear the soft-deleted flag |
+| POST | `/api/archive/reopen` | reopen a stored plan as a live review on a workstation agent |
+| POST | `/api/archive/apply` | hand a stored plan to an implementation agent on a workstation |
 | GET | `/` | live sessions page |
 | GET | `/plans` | archive browser |
 
 The archive index is cached (`HUB_ARCHIVE_CACHE`, default 20s) and the session
 list is refreshed by a background scanner every `HUB_INTERVAL` seconds.
+
+## Archive store
+
+The read-only aggregation above is stateless: it re-reads each workstation's
+archive on demand. The **archive store** is the writable, persistent layer on
+top of it — a real archive the user can tag, edit, delete and restore, unlike
+`plannotator archive` itself (which is strictly read-only).
+
+Storage lives under `HUB_ARCHIVE_DIR` (default `/opt/plan-hub/archive`):
+
+```
+<HUB_ARCHIVE_DIR>/
+  index.json        {"version":1,"plans":{"<id>":{...metadata...}}}
+  plans/<id>.md     the markdown body for each plan
+```
+
+Metadata per plan: `id` (`p_<8hex>`, URL-safe and stable), `title`, `slug`,
+`project`, `host`, `originFilename`, `date`, `status`
+(`approved|denied|other`), `tags` (normalised), `note`, `source`
+(`import|live`), `archivedAt`, `updatedAt`, `size`, `deleted`.
+
+- **Import** accepts either `{"host","filename"}` (from a workstation archive)
+  or `{"host","port"}` (from a live session's `GET /api/plan`). It is
+  **idempotent** on `(host, originFilename)`: re-importing updates the existing
+  entry (and clears its soft-delete flag) instead of duplicating it.
+- **Tags** are normalised (lowercase, trimmed, spaces collapsed, empties
+  dropped, de-duplicated, ≤32 chars, ≤20 per plan). `tags` on update replaces
+  the whole array.
+- **Soft delete** sets `deleted:true`; the plan stays on disk and is excluded
+  from the default listing (`?includeDeleted=1` shows it) until `restore`
+  clears the flag. **Hard delete** (`{"hard":true}`) removes both the index
+  entry and its markdown file.
+- The store is additive: `/api/plans` and `/api/plans/raw` keep serving the
+  workstation-wide read-only catalogue unchanged. A UI "import this plan"
+  action calls `/api/archive/import` with a `host`+`filename` pair taken from
+  `/api/plans`.
+- Index writes are atomic (temp file + `os.replace`) and serialised by a
+  dedicated lock. A missing or corrupt `index.json` is logged and treated as
+  empty rather than crashing the server; the next successful write repairs it.
+  Directories are created on first use.
+
+
+## Workstation actions
+
+Two operations can only happen where the Plannotator CLI and its state live, so
+each workstation runs a small **planhub-agent** (`workstation/planhub-agent.py`,
+systemd user service `planhub-agent.service`, bound `0.0.0.0:8898`). The hub
+never talks to it without a shared token.
+
+- `HUB_AGENTS="host:port=token,host:port=token"` maps each workstation to its
+  agent. The token is the agent's `PLANHUB_AGENT_TOKEN`, sent as the
+  `X-Planhub-Token` header. Agent routes other than `/healthz` require it and
+  are compared in constant time; an agent with no token refuses to start.
+- `POST /api/archive/reopen` `{"id","host"?}` reads the stored markdown and
+  asks the workstation agent to launch
+  `plannotator annotate <file> --gate --json --result-file <file>.result.json`
+  detached, returning the new session's `file`, `pid`, `port` and `url`. The
+  default host is the stored entry's `host`, else the first configured agent.
+- `POST /api/archive/apply` `{"id","host"?,"projectDir"?}` asks the agent to
+  run its **environment-configured** `PLANHUB_APPLY_COMMAND` (never a command
+  from the request) with `{plan}`/`{project}` substituted, recording a job.
+  Returns `{"jobId":…}`; jobs are listed/queried on the agent
+  (`/api/agent/jobs`, `/api/agent/job?id=`).
+- Agent-side errors (unreachable, 401, missing apply config) are surfaced by the
+  hub as `{"ok":false,"error":…}` with HTTP 502. The hub proxies the agent's
+  result rather than re-implementing it.
+
+Each agent also needs its own LAN IP (`PLANHUB_URL_HOST`) and Plannotator port
+slice (`PLANHUB_PORT_RANGE`) so the reopened session advertises the correct URL
+and binds a port unique to that workstation.
+
 
 ## Decision endpoint
 
@@ -63,8 +143,8 @@ list is refreshed by a background scanner every `HUB_INTERVAL` seconds.
 where `decision` is `approve` or `deny`. The hub builds the corresponding
 upstream request (`POST http://<host>:<port>/api/approve|deny`) and returns the
 result. It is a thin forwarder: upstream errors are reported back in the JSON
-body rather than raised. This is the only non-GET path, and it is why the hub
-must sit behind an authentication gate.
+body rather than raised. Along with the `/api/archive/*` write actions, it is
+why the hub must sit behind an authentication gate.
 
 ## OAuth gate
 

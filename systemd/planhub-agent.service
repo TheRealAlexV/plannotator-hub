@@ -1,0 +1,20 @@
+[Unit]
+Description=Plan Hub workstation agent (reopen / apply)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# All configuration comes from the environment file below. Copy
+# systemd/planhub-agent.env.example to /etc/planhub-agent.env, set
+# PLANHUB_AGENT_TOKEN (fail-closed: the agent refuses to start without it),
+# and make sure the invoking user can read the file. The leading '-' keeps the
+# unit loadable before the file exists.
+EnvironmentFile=-/etc/planhub-agent.env
+ExecStart=/usr/bin/python3 %h/.local/bin/planhub-agent.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
