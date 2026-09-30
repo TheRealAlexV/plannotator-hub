@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Plannotator CLI update
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=45m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

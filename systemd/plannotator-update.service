@@ -1,0 +1,6 @@
+[Unit]
+Description=Update the Plannotator CLI to the latest release
+
+[Service]
+Type=oneshot
+ExecStart=/home/user/.local/bin/plannotator-update.sh

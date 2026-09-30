@@ -1,0 +1,15 @@
+[Unit]
+Description=Plannotator plan archive (read-only browser for ~/.plannotator/plans)
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=PLANNOTATOR_SKIP_BROWSER_OPEN=1
+Environment=PLANNOTATOR_REMOTE=1
+Environment=PLANNOTATOR_PORT=8897
+ExecStart=/home/user/.local/bin/plannotator archive
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

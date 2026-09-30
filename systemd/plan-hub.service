@@ -1,0 +1,20 @@
+[Unit]
+Description=Plannotator session hub + plan archive
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# All HUB_* configuration comes from the environment file below. Copy the
+# repo's systemd/plan-hub.env.example to /etc/plan-hub.env and edit it.
+# The leading '-' keeps the unit startable (with built-in defaults) even if
+# the file has not been installed yet.
+EnvironmentFile=-/etc/plan-hub.env
+ExecStart=/usr/bin/python3 /opt/plan-hub/plan-hub.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
